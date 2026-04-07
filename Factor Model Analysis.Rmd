@@ -1,0 +1,345 @@
+---
+title: "Factor Model Analysis of Vietnamese Stock Market 2023 (HOSE)"
+author: "Minh Duc Nguyen"
+date: "`r Sys.Date()`"
+output:
+  word_document:
+    toc: true
+  html_document:
+    df_print: paged
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 9,
+  fig.height = 5
+)
+```
+
+# 1. Library
+
+```{r libraries}
+library(readxl)
+library(lmtest)
+library(sandwich)
+library(car)
+library(zoo)
+library(ggplot2)
+library(corrplot)
+library(knitr)
+library(dplyr)
+
+PATH_PRICE <- "data/dinhgia1.50_cp_hose.xlsx"   
+PATH_META  <- "data/dinhgia1.vh.xlsx"     
+
+RISK_FREE_ANNUAL <- 0.0321          
+N_DAYS           <- 248             
+N_STOCKS         <- 50          
+```
+
+
+```{r load-prices}
+raw <- read_excel(PATH_PRICE)
+price_data <- raw[, -1]   
+```
+
+# 2. Log-return
+```{r calc-returns}
+# log-return: r_t = ln(P_t / P_{t-1}) ---
+calc_log_return <- function(price_vec) {
+  p <- as.numeric(price_vec)
+  diff(log(p))                  
+}
+
+r <- as.data.frame(
+  lapply(price_data, calc_log_return)
+)
+colnames(r) <- colnames(price_data)
+```
+
+
+# 3. Fama-French Factor
+
+## 3.1. F1 — Market Factor (Mkt-RF)
+
+```{r factor-f1}
+# Log-return of VNINDEX
+r_VnIndex <- r[["VnIndex"]]
+
+# Daily free-risk rate
+r_f <- rep((1 + RISK_FREE_ANNUAL)^(1 / 365) - 1, nrow(r))
+
+# F1 = Excess market return
+F1 <- r_VnIndex - r_f
+
+```
+
+## 3.2. F2 — SMB Factor (Small Minus Big)
+
+```{r factor-f2}
+meta  <- read_excel(PATH_META)
+#Capitalization
+CSVH  <- as.numeric(meta[1, -1])      
+
+med_cap <- median(CSVH)
+idx_big   <- which(CSVH > med_cap)        
+idx_small <- which(CSVH < med_cap)         
+
+r_big   <- r[, idx_big,   drop = FALSE] #Big capitalization stock
+r_small <- r[, idx_small, drop = FALSE] #Small capitalization stock
+
+# F2 = Average(Small) - Average(Big)
+F2 <- rowMeans(r_small) - rowMeans(r_big)
+```
+
+## 3.3. F3 — HML Factor (High Minus Low BtM)
+
+```{r factor-f3}
+# Book-to-Market ratio
+BtM <- as.numeric(meta[2, -1])
+
+q33 <- quantile(BtM, 1/3, na.rm = TRUE)
+q67 <- quantile(BtM, 2/3, na.rm = TRUE)
+
+idx_low  <- which(BtM < q33)              # Low BtM 
+idx_high <- which(BtM > q67)              # High BtM
+
+r_high <- r[, idx_high, drop = FALSE]
+r_low  <- r[, idx_low,  drop = FALSE]
+
+# F3 = Average(High BtM) - Average(Low BtM)
+F3 <- rowMeans(r_high) - rowMeans(r_low)
+
+```
+
+# 4. Correlation Between Factors
+
+```{r factor-corr}
+factor_mat <- data.frame(F1_Market = F1, F2_SMB = F2, F3_HML = F3)
+corr_mat   <- cor(factor_mat)
+
+kable(round(corr_mat, 4), caption = "Correlation Matrix Between 3 Factors")
+
+corrplot(corr_mat,
+         method   = "color",
+         type     = "upper",
+         addCoef.col = "black",
+         tl.col   = "black",
+         title    = "Correlation Between Fama-French Factors",
+         mar      = c(0, 0, 2, 0))
+```
+
+# 5. Fama-French Regression
+
+```{r reg-all-stocks}
+models     <- vector("list", N_STOCKS)
+coef_table <- data.frame(matrix(NA, N_STOCKS, 4))
+colnames(coef_table) <- c("alpha", "Beta1", "Beta2", "Beta3")
+
+for (i in 1:N_STOCKS) {
+  models[[i]]     <- lm(r[, i] ~ F1 + F2 + F3)
+  coef_table[i, ] <- coef(models[[i]])
+}
+rownames(coef_table) <- colnames(r)[1:N_STOCKS]
+```
+
+```{r plot-betas}
+# Distribution of Beta coefficients across 50 stocks
+par(mfrow = c(1, 3))
+hist(coef_table$Beta1, main = "Distribution of Beta1 (Market)",
+     xlab = "Beta1", col = "#4E79A7", border = "white", breaks = 15)
+abline(v = mean(coef_table$Beta1), col = "red", lwd = 2, lty = 2)
+
+hist(coef_table$Beta2, main = "Distribution of Beta2 (SMB)",
+     xlab = "Beta2", col = "#F28E2B", border = "white", breaks = 15)
+abline(v = mean(coef_table$Beta2), col = "red", lwd = 2, lty = 2)
+
+hist(coef_table$Beta3, main = "Distribution of Beta3 (HML)",
+     xlab = "Beta3", col = "#59A14F", border = "white", breaks = 15)
+abline(v = mean(coef_table$Beta3), col = "red", lwd = 2, lty = 2)
+par(mfrow = c(1, 1))
+```
+
+# 6. Group Portfolios & Regression
+
+## 6.1 Define 4 groups of stocks based on size and BtM
+
+```{r define-portfolios}
+idx_BH <- intersect(idx_big,   idx_high)   # Big / High BtM
+idx_BL <- intersect(idx_big,   idx_low)    # Big / Low BtM
+idx_SH <- intersect(idx_small, idx_high)   # Small / High BtM
+idx_SL <- intersect(idx_small, idx_low)    # Small / Low BtM
+
+cat(sprintf("B/H: %d Stocks | B/L: %d Stocks | S/H: %d Stocks | S/L: %d Stocks\n",
+    length(idx_BH), length(idx_BL), length(idx_SH), length(idx_SL)))
+
+r_bh <- if (length(idx_BH) > 0) rowMeans(r[, idx_BH, drop = FALSE]) else rep(NA, nrow(r))
+r_bl <- if (length(idx_BL) > 0) rowMeans(r[, idx_BL, drop = FALSE]) else rep(NA, nrow(r))
+r_sh <- if (length(idx_SH) > 0) rowMeans(r[, idx_SH, drop = FALSE]) else rep(NA, nrow(r))
+r_sl <- if (length(idx_SL) > 0) rowMeans(r[, idx_SL, drop = FALSE]) else rep(NA, nrow(r))
+```
+
+## 6.2. Regression
+
+```{r reg-portfolios}
+reg1 <- lm(r_bh ~ F1 + F2 + F3); cat("=== B/H ===\n"); print(summary(reg1))
+reg2 <- lm(r_bl ~ F1 + F2 + F3); cat("=== B/L ===\n"); print(summary(reg2))
+reg3 <- lm(r_sh ~ F1 + F2 + F3); cat("=== S/H ===\n"); print(summary(reg3))
+reg4 <- lm(r_sl ~ F1 + F2 + F3); cat("=== S/L ===\n"); print(summary(reg4))
+```
+
+## 6.3. VIF test
+
+```{r vif-check}
+cat("VIF test for B/H:\n"); print(vif(reg1))
+cat("\nVIF test for B/L:\n"); print(vif(reg2))
+cat("\nVIF test for S/H:\n"); print(vif(reg3))
+cat("\nVIF test for S/L:\n"); print(vif(reg4))
+```
+
+# 7. Hypothesis Testing
+## RESET-test & Breusch-Pagan test
+
+```{r diag-tests}
+run_diagnostics <- function(model, label) {
+  reset <- resettest(model, type = "regressor")
+  bp    <- bptest(model)
+  dw    <- dwtest(model)
+  bg    <- bgtest(model, order = 5)
+
+  data.frame(
+    Portfolio    = label,
+    RESET_pval   = round(reset$p.value, 4),
+    BP_pval      = round(bp$p.value, 4),
+    DW_pval      = round(dw$p.value, 4),
+    BG5_pval     = round(bg$p.value, 4),
+    Form_OK      = reset$p.value > 0.05,
+    Homosked_OK  = bp$p.value > 0.05,
+    NoAutoCorr_OK= dw$p.value > 0.05
+  )
+}
+
+diag_results <- rbind(
+  run_diagnostics(reg1, "B/H"),
+  run_diagnostics(reg2, "B/L"),
+  run_diagnostics(reg3, "S/H"),
+  run_diagnostics(reg4, "S/L")
+)
+
+kable(diag_results, caption = "Diagnostic Tests for Portfolio Regressions")
+```
+
+# 8. Estimate Risk-Premia  (Fama-MacBeth Step 2)
+
+```{r risk-premium}
+# mean-return
+r_mean <- colMeans(r[, 1:N_STOCKS])
+
+datanew <- data.frame(
+  r_mean = r_mean,
+  alpha  = coef_table$alpha,
+  Beta1  = coef_table$Beta1,
+  Beta2  = coef_table$Beta2,
+  Beta3  = coef_table$Beta3
+)
+
+# r_mean ~ Beta
+datanew$intercept <- 1
+reg_cs <- lm(r_mean ~ intercept + Beta1 + Beta2 + Beta3 - 1, data = datanew)
+summary(reg_cs)
+
+# Estimate robust standard error (Newey-West)
+coeftest(reg_cs, vcov = NeweyWest(reg_cs, lag = 5))
+```
+
+# 9. APT test
+
+```{r apt-test}
+reg_APT <- lm(r_mean ~ intercept + Beta1 + Beta2 + Beta3 - 1, data = datanew)
+summary(reg_APT)
+
+r_f_daily <- mean(r_f)
+hyp_str   <- paste0("intercept = ", format(r_f_daily, scientific = FALSE, digits = 15))
+cat(sprintf("\nintercept = r_f (%.8f) test:\n", r_f_daily))
+cat("Hypothesis:", hyp_str, "\n")
+linearHypothesis(reg_APT, hyp_str)
+```
+
+# 10. Portfolio Risk Analysis
+
+## 10.1. Covariance Matrix of Factors and Errors
+
+```{r cov-matrices}
+VF <- cov(factor_mat)
+cat("Covariance Matric of Factors:\n")
+print(round(VF, 8))
+
+resid_mat <- do.call(cbind, lapply(models, residuals))
+cov_resid <- cov(resid_mat)
+```
+
+## 10.2. Risk Decomposition for Each Stock
+
+```{r risk-decomp}
+Beta_mat <- as.matrix(coef_table[, c("Beta1", "Beta2", "Beta3")])
+
+risk_table <- data.frame(
+  Stock             = rownames(coef_table),
+  Systematic_Risk   = numeric(N_STOCKS),
+  Idiosyncratic_Risk= numeric(N_STOCKS),
+  Total_Risk        = numeric(N_STOCKS),
+  R_squared         = sapply(models, function(m) summary(m)$r.squared)
+)
+
+for (i in 1:N_STOCKS) {
+  # Systematic Risk: β' Σ_F β 
+  risk_table$Systematic_Risk[i]    <- as.numeric(Beta_mat[i, ] %*% VF %*% Beta_mat[i, ])
+  risk_table$Idiosyncratic_Risk[i] <- var(resid(models[[i]]))
+  risk_table$Total_Risk[i]         <- risk_table$Systematic_Risk[i] + risk_table$Idiosyncratic_Risk[i]
+}
+
+```
+
+```{r plot-risk}
+# Proportion of systematic risk to total risk Plot
+risk_table$Sys_Ratio <- risk_table$Systematic_Risk / risk_table$Total_Risk
+
+ggplot(risk_table, aes(x = reorder(Stock, Sys_Ratio), y = Sys_Ratio)) +
+  geom_col(fill = "#4E79A7", alpha = 0.85) +
+  geom_hline(yintercept = mean(risk_table$Sys_Ratio), color = "red",
+             linetype = "dashed", linewidth = 0.8) +
+  coord_flip() +
+  labs(title    = "Proportion of Systematic Risk to Total Risk for Each Stock",
+       subtitle = paste0("Red line: Mean = ",
+                         round(mean(risk_table$Sys_Ratio) * 100, 1), "%"),
+       x = "Stock", y = "Proportion of Systematic Risk") +
+  theme_minimal(base_size = 10)
+```
+
+## 10.3. Equal-Weight Portfolio Risk
+
+```{r portfolio-risk}
+n  <- N_STOCKS
+w  <- matrix(rep(1/n, n), nrow = 1)           # Equal-weight
+w_vec <- as.numeric(w)
+
+Beta_p  <- w %*% Beta_mat                      # Portfolio Beta (1x3)
+Sys_p   <- as.numeric(Beta_p %*% VF %*% t(Beta_p))    # Portfolio Systematic Risk
+Idio_p  <- sum(w_vec^2 * risk_table$Idiosyncratic_Risk)   # Portfolio Idiosyncratic Risk (assuming no correlation between residuals)
+Total_p <- Sys_p + Idio_p
+
+cat("=== Equal-Weight Portfolio (1/50) ===\n")
+cat(sprintf("Portfolio Beta:        %.5f  %.5f  %.5f\n", Beta_p[1], Beta_p[2], Beta_p[3]))
+cat(sprintf("Systematic Risk:      %.8f\n", Sys_p))
+cat(sprintf("Idiosyncratic Risk:  %.8f\n", Idio_p))
+cat(sprintf("Total Risk:          %.8f\n", Total_p))
+cat(sprintf("Rate of Diversification:    %.2f%%\n", (1 - Sys_p/Total_p)*100))
+```
